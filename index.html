@@ -1,0 +1,735 @@
+
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Japanese Voice Assistant — Continuous</title>
+
+  <style>
+    * { box-sizing: border-box; }
+
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 800px;
+      margin: 40px auto;
+      padding: 20px;
+      background: #101827;
+      color: #f1f5f9;
+    }
+
+    h1 { margin-bottom: 8px; }
+
+    button {
+      padding: 12px 24px;
+      margin-right: 10px;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      background: #3b82f6;
+      color: white;
+      font-size: 15px;
+    }
+
+    button:disabled {
+      opacity: 0.4;
+      cursor: default;
+    }
+
+    #stop { background: #dc2626; }
+
+    .panel {
+      background: #1e293b;
+      padding: 18px;
+      border-radius: 12px;
+      margin-top: 18px;
+    }
+
+    .panel h3 {
+      margin-top: 0;
+      color: #93c5fd;
+    }
+
+    #transcript {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      min-height: 55px;
+      font-size: 18px;
+    }
+
+    .turn {
+      border-top: 1px solid #475569;
+      padding: 15px 0;
+    }
+
+    .turn:first-child { border-top: none; }
+
+    .user-text {
+      color: #93c5fd;
+      white-space: pre-wrap;
+      margin-bottom: 10px;
+    }
+
+    .assistant-text {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      line-height: 1.7;
+    }
+
+    .turn-status {
+      font-size: 12px;
+      color: #94a3b8;
+      margin-top: 8px;
+    }
+
+    #status { color: #93c5fd; }
+
+    #error {
+      color: #fca5a5;
+      white-space: pre-wrap;
+    }
+
+    .hint {
+      color: #94a3b8;
+      font-size: 13px;
+    }
+  </style>
+</head>
+
+<body>
+  <h1>Japanese Voice Assistant</h1>
+  <p class="hint">
+    Continuous microphone · Automatic VAD · Overlapping LLM requests
+  </p>
+
+  <p id="status">Ready</p>
+
+  <button id="start">Start listening</button>
+  <button id="stop" disabled>Stop listening</button>
+
+  <div class="panel">
+    <h3>Live Japanese Transcription</h3>
+    <div id="transcript"></div>
+  </div>
+
+  <div class="panel">
+    <h3>Conversation</h3>
+    <div id="conversation"></div>
+  </div>
+
+  <p id="error"></p>
+
+  <script>
+    // -----------------------------------------
+    // Configuration
+    // -----------------------------------------
+
+    const TARGET_RATE = 16000;
+    const CHUNK_SAMPLES = 8000;
+
+    const VAD_THRESHOLD = 0.015;
+    const SILENCE_DURATION_MS = 1000;
+    const MIN_SPEECH_DURATION_MS = 300;
+
+    // Retain audio before VAD confirms speech.
+    const PRE_ROLL_MS = 300;
+    const PRE_ROLL_SAMPLES =
+      Math.round(TARGET_RATE * PRE_ROLL_MS / 1000);
+
+    const startButton = document.getElementById("start");
+    const stopButton = document.getElementById("stop");
+    const transcript = document.getElementById("transcript");
+    const conversation = document.getElementById("conversation");
+    const status = document.getElementById("status");
+    const errorOutput = document.getElementById("error");
+
+    // Microphone lifetime state
+    let listening = false;
+    let microphoneStream = null;
+    let audioContext = null;
+    let source = null;
+    let processor = null;
+
+    // ASR lifetime state
+    let currentSession = null;
+    let sessionStarting = false;
+    let finalizing = false;
+
+    // VAD state
+    let speechDetected = false;
+    let speechDurationMs = 0;
+    let silenceDurationMs = 0;
+
+    // Pre-speech buffer
+    let preRoll = new Float32Array(0);
+
+    let turnNumber = 0;
+    const activeLLMRequests = new Set();
+
+    // -----------------------------------------
+    // Audio resampling
+    // -----------------------------------------
+
+    function resample(input, inputRate) {
+      if (inputRate === TARGET_RATE) {
+        return new Float32Array(input);
+      }
+
+      const outputLength = Math.round(
+        input.length * TARGET_RATE / inputRate
+      );
+
+      const output = new Float32Array(outputLength);
+      const ratio = inputRate / TARGET_RATE;
+
+      for (let i = 0; i < outputLength; i++) {
+        const position = i * ratio;
+        const left = Math.min(
+          Math.floor(position),
+          input.length - 1
+        );
+        const right = Math.min(left + 1, input.length - 1);
+        const fraction = position - left;
+
+        output[i] =
+          input[left] * (1 - fraction) +
+          input[right] * fraction;
+      }
+
+      return output;
+    }
+
+    // -----------------------------------------
+    // Audio buffers
+    // -----------------------------------------
+
+    function appendFloat32(a, b) {
+      const result = new Float32Array(a.length + b.length);
+      result.set(a, 0);
+      result.set(b, a.length);
+      return result;
+    }
+
+    function updatePreRoll(samples) {
+      preRoll = appendFloat32(preRoll, samples);
+
+      if (preRoll.length > PRE_ROLL_SAMPLES) {
+        preRoll = preRoll.slice(
+          preRoll.length - PRE_ROLL_SAMPLES
+        );
+      }
+    }
+
+    // -----------------------------------------
+    // ASR session creation
+    // -----------------------------------------
+
+    async function createSession() {
+      const response = await fetch("/asr/start", {
+        method: "POST"
+      });
+
+      if (!response.ok) {
+        throw new Error(
+          `ASR start failed: ${await response.text()}`
+        );
+      }
+
+      const result = await response.json();
+
+      return {
+        id: result.session_id,
+        pending: new Float32Array(0),
+        queue: Promise.resolve(),
+        error: null,
+        partial: ""
+      };
+    }
+
+    // -----------------------------------------
+    // Sequential ASR chunk requests
+    // -----------------------------------------
+
+    function queueChunk(session, chunk) {
+      const bytes = new Float32Array(chunk);
+
+      session.queue = session.queue.then(async () => {
+        if (session.error) throw session.error;
+
+        const response = await fetch(
+          `/asr/chunk?session_id=${encodeURIComponent(session.id)}`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/octet-stream"
+            },
+            body: bytes.buffer
+          }
+        );
+
+        if (!response.ok) {
+          throw new Error(
+            `ASR chunk failed: ${await response.text()}`
+          );
+        }
+
+        const result = await response.json();
+        session.partial = result.text || "";
+
+        // Don't let an old session overwrite a newer one.
+        if (currentSession === session) {
+          transcript.textContent = session.partial;
+        }
+      }).catch(error => {
+        session.error = error;
+        throw error;
+      });
+
+      // Prevent unhandled rejection while retaining error
+      // propagation through session.queue.
+      session.queue.catch(() => {});
+    }
+
+    function addSamples(session, samples) {
+      session.pending = appendFloat32(
+        session.pending,
+        samples
+      );
+
+      while (session.pending.length >= CHUNK_SAMPLES) {
+        const chunk = session.pending.slice(
+          0, CHUNK_SAMPLES
+        );
+
+        session.pending = session.pending.slice(
+          CHUNK_SAMPLES
+        );
+
+        queueChunk(session, chunk);
+      }
+    }
+
+    function flushSession(session) {
+      if (session.pending.length > 0) {
+        queueChunk(session, session.pending);
+        session.pending = new Float32Array(0);
+      }
+    }
+
+    // -----------------------------------------
+    // Start a new utterance
+    // -----------------------------------------
+
+    async function beginUtterance(initialAudio) {
+      if (!listening || currentSession || sessionStarting) {
+        return;
+      }
+
+      sessionStarting = true;
+      status.textContent = "Speech detected — starting ASR";
+
+      try {
+        const session = await createSession();
+
+        currentSession = session;
+        speechDetected = true;
+
+        addSamples(session, initialAudio);
+
+        status.textContent = "Listening to speech...";
+
+      } catch (error) {
+        errorOutput.textContent = error.message;
+        status.textContent = "ASR session error";
+
+      } finally {
+        sessionStarting = false;
+      }
+    }
+
+    // -----------------------------------------
+    // VAD
+    // -----------------------------------------
+
+    function detectVoice(input, sampleRate, converted) {
+      if (!listening) return;
+
+      let energy = 0;
+
+      for (let i = 0; i < input.length; i++) {
+        energy += input[i] * input[i];
+      }
+
+      const rms = Math.sqrt(energy / input.length);
+      const durationMs = input.length / sampleRate * 1000;
+
+      const voiced = rms > VAD_THRESHOLD;
+
+      // While session creation is pending, preserve recent
+      // microphone audio in the pre-roll buffer.
+      if (sessionStarting) {
+        updatePreRoll(converted);
+        return;
+      }
+
+      if (!currentSession) {
+        updatePreRoll(converted);
+
+        if (voiced && !finalizing) {
+          speechDurationMs += durationMs;
+
+          if (speechDurationMs >= MIN_SPEECH_DURATION_MS) {
+            const initialAudio = preRoll.slice();
+
+            preRoll = new Float32Array(0);
+            speechDurationMs = 0;
+            silenceDurationMs = 0;
+
+            beginUtterance(initialAudio);
+          }
+        } else {
+          speechDurationMs = 0;
+        }
+
+        return;
+      }
+
+      // Streaming audio to the current ASR session.
+      addSamples(currentSession, converted);
+
+      if (voiced) {
+        silenceDurationMs = 0;
+      } else {
+        silenceDurationMs += durationMs;
+      }
+
+      if (
+        silenceDurationMs >= SILENCE_DURATION_MS &&
+        !finalizing
+      ) {
+        finalizeUtterance();
+      }
+    }
+
+    // -----------------------------------------
+    // Conversation UI
+    // -----------------------------------------
+
+    function createTurn(text) {
+      turnNumber++;
+
+      const wrapper = document.createElement("div");
+      wrapper.className = "turn";
+
+      const user = document.createElement("div");
+      user.className = "user-text";
+      user.textContent = `You: ${text}`;
+
+      const assistant = document.createElement("div");
+      assistant.className = "assistant-text";
+
+      const turnStatus = document.createElement("div");
+      turnStatus.className = "turn-status";
+      turnStatus.textContent = "Qwen responding...";
+
+      wrapper.appendChild(user);
+      wrapper.appendChild(assistant);
+      wrapper.appendChild(turnStatus);
+
+      conversation.prepend(wrapper);
+
+      return { assistant, turnStatus };
+    }
+
+    // -----------------------------------------
+    // Independent concurrent LLM streaming
+    // -----------------------------------------
+
+    async function streamLLM(text) {
+      const { assistant, turnStatus } = createTurn(text);
+      const controller = new AbortController();
+
+      activeLLMRequests.add(controller);
+
+      try {
+        const response = await fetch("/llm", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ text }),
+          signal: controller.signal
+        });
+
+        if (!response.ok) {
+          throw new Error(
+            `LLM failed: ${await response.text()}`
+          );
+        }
+
+        if (!response.body) {
+          throw new Error("No LLM response body");
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+
+        let buffer = "";
+        let fullText = "";
+        let finished = false;
+
+        function processEvent(eventText) {
+          for (const line of eventText.split(/\r?\n/)) {
+            if (!line.startsWith("data:")) continue;
+
+            const raw = line.slice(5).trim();
+            if (!raw) continue;
+
+            const data = JSON.parse(raw);
+
+            if (typeof data.token === "string") {
+              fullText += data.token;
+              assistant.textContent = fullText;
+            }
+
+            if (data.done === true) {
+              finished = true;
+            }
+
+            if (data.error) {
+              throw new Error(String(data.error));
+            }
+          }
+        }
+
+        function processBuffer(final = false) {
+          const events = buffer.split(/\r?\n\r?\n/);
+          buffer = events.pop();
+
+          for (const eventText of events) {
+            if (eventText.trim()) {
+              processEvent(eventText);
+            }
+          }
+
+          if (final && buffer.trim()) {
+            processEvent(buffer);
+            buffer = "";
+          }
+        }
+
+        while (true) {
+          const { value, done } = await reader.read();
+
+          if (done) break;
+
+          buffer += decoder.decode(value, {
+            stream: true
+          });
+
+          processBuffer();
+        }
+
+        buffer += decoder.decode();
+        processBuffer(true);
+
+        turnStatus.textContent = finished
+          ? "Complete"
+          : "Stream ended unexpectedly";
+
+      } catch (error) {
+        if (error.name === "AbortError") {
+          turnStatus.textContent = "Cancelled";
+        } else {
+          turnStatus.textContent = `Error: ${error.message}`;
+        }
+
+      } finally {
+        activeLLMRequests.delete(controller);
+      }
+    }
+
+    // -----------------------------------------
+    // Finalize utterance without stopping mic
+    // -----------------------------------------
+
+    async function finalizeUtterance() {
+      if (!currentSession || finalizing) return;
+
+      finalizing = true;
+
+      const session = currentSession;
+      currentSession = null;
+
+      speechDetected = false;
+      speechDurationMs = 0;
+      silenceDurationMs = 0;
+      preRoll = new Float32Array(0);
+
+      status.textContent = "Finalizing utterance...";
+
+      try {
+        flushSession(session);
+        await session.queue;
+
+        const response = await fetch(
+          `/asr/finish?session_id=${encodeURIComponent(session.id)}`,
+          { method: "POST" }
+        );
+
+        if (!response.ok) {
+          throw new Error(
+            `ASR finish failed: ${await response.text()}`
+          );
+        }
+
+        const result = await response.json();
+        const text = (result.text || "").trim();
+
+        if (text) {
+          transcript.textContent = text;
+
+          // Do not await: allow ASR and LLM to overlap.
+          streamLLM(text);
+        }
+
+        if (listening) {
+          status.textContent = "Listening for next utterance...";
+        }
+
+      } catch (error) {
+        errorOutput.textContent = error.message;
+        status.textContent = "ASR finalize error";
+
+      } finally {
+        finalizing = false;
+      }
+    }
+
+    // -----------------------------------------
+    // Microphone lifecycle
+    // -----------------------------------------
+
+    async function startListening() {
+      startButton.disabled = true;
+      stopButton.disabled = true;
+
+      errorOutput.textContent = "";
+      transcript.textContent = "";
+      conversation.textContent = "";
+
+      try {
+        microphoneStream =
+          await navigator.mediaDevices.getUserMedia({
+            audio: {
+              channelCount: 1,
+              echoCancellation: true,
+              noiseSuppression: true
+            }
+          });
+
+        audioContext = new AudioContext();
+
+        source = audioContext.createMediaStreamSource(
+          microphoneStream
+        );
+
+        processor = audioContext.createScriptProcessor(
+          4096, 1, 1
+        );
+
+        preRoll = new Float32Array(0);
+        currentSession = null;
+        speechDetected = false;
+        speechDurationMs = 0;
+        silenceDurationMs = 0;
+        finalizing = false;
+        sessionStarting = false;
+
+        processor.onaudioprocess = event => {
+          if (!listening) return;
+
+          const input = event.inputBuffer.getChannelData(0);
+
+          const converted = resample(
+            input,
+            audioContext.sampleRate
+          );
+
+          detectVoice(
+            input,
+            audioContext.sampleRate,
+            converted
+          );
+        };
+
+        source.connect(processor);
+        processor.connect(audioContext.destination);
+
+        await audioContext.resume();
+
+        listening = true;
+
+        startButton.disabled = true;
+        stopButton.disabled = false;
+
+        status.textContent = "Listening continuously...";
+
+      } catch (error) {
+        errorOutput.textContent = error.message;
+        status.textContent = "Microphone error";
+
+        await stopListening();
+      }
+    }
+
+    async function stopListening() {
+      listening = false;
+
+      stopButton.disabled = true;
+      status.textContent = "Stopping microphone...";
+
+      if (processor) {
+        processor.onaudioprocess = null;
+        processor.disconnect();
+        processor = null;
+      }
+
+      if (source) {
+        source.disconnect();
+        source = null;
+      }
+
+      if (microphoneStream) {
+        microphoneStream.getTracks().forEach(
+          track => track.stop()
+        );
+
+        microphoneStream = null;
+      }
+
+      if (audioContext) {
+        const context = audioContext;
+        audioContext = null;
+
+        if (context.state !== "closed") {
+          await context.close();
+        }
+      }
+
+      // Finalize any utterance that is still active.
+      if (currentSession) {
+        await finalizeUtterance();
+      }
+
+      startButton.disabled = false;
+      stopButton.disabled = true;
+
+      status.textContent = "Microphone stopped";
+    }
+
+    startButton.onclick = startListening;
+    stopButton.onclick = stopListening;
+  </script>
+</body>
+</html>
